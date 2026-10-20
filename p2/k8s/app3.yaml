@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app3-content
+data:
+  index.html: |
+    <!doctype html>
+    <html lang="en">
+      <head><title>app3</title></head>
+      <body><h1>app3 - default application</h1></body>
+    </html>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app3-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app3-app
+  template:
+    metadata:
+      labels:
+        app: app3-app
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:latest
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: app3-content
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+      volumes:
+        - name: app3-content
+          configMap:
+            name: app3-content
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app3-service
+spec:
+  selector:
+    app: app3-app
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP
