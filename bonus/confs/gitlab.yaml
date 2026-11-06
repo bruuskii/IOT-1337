@@ -106,6 +106,12 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 60 # Allows up to 10 min for initial DB migrations
+
+      # The volume the three mounts above refer to: the gitlab-data claim.
+      volumes:
+        - name: gitlab-storage
+          persistentVolumeClaim:
+            claimName: gitlab-data
 ---
 apiVersion: v1
 kind: Service
