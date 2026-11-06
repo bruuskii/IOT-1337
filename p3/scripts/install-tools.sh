@@ -25,7 +25,7 @@ fi
 $SUDO systemctl enable --now docker
 
 # Let the invoking user talk to Docker without sudo (takes effect in new
-# sessions; the calling scripts use `sg docker` meanwhile).
+# sessions; the calling scripts re-run themselves with the new group meanwhile).
 TARGET_USER="${SUDO_USER:-$(id -un)}"
 if [ "$TARGET_USER" != "root" ] && ! id -nG "$TARGET_USER" | grep -qw docker; then
   echo "[tools] Adding $TARGET_USER to the docker group..."

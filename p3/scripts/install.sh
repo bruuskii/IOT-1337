@@ -18,7 +18,13 @@ APP_NAME="playground"
 if ! docker info >/dev/null 2>&1; then
   if [ -z "${IOT_SG_REEXEC:-}" ] && getent group docker | grep -qw "$(id -un)"; then
     export IOT_SG_REEXEC=1
-    exec sg docker -c "$(printf '%q ' bash "${BASH_SOURCE[0]}" "$@")"
+    if command -v sg >/dev/null 2>&1; then
+      exec sg docker -c "$(printf '%q ' bash "${BASH_SOURCE[0]}" "$@")"
+    fi
+    # Ubuntu 26.04 no longer ships sg/newgrp: a sudo session for the same user
+    # also starts with the up-to-date group list (sudo is already cached by
+    # install-tools.sh, so this does not prompt again).
+    exec sudo -u "$(id -un)" env IOT_SG_REEXEC=1 bash "${BASH_SOURCE[0]}" "$@"
   fi
   echo "Cannot reach the Docker daemon (is it running, are you in the docker group?)" >&2
   exit 1
