@@ -18,9 +18,8 @@ DEV_NS="dev"
 GITLAB_NS="gitlab"
 APP_NAME="playground"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFS_DIR="${SCRIPT_DIR}/../confs"
-
-GITLAB_ROOT_PASSWORD="${GITLAB_ROOT_PASSWORD:password}"
+CONFS_DIR="${SCRIPT_DIR}/../config"
+GITLAB_ROOT_PASSWORD="${GITLAB_ROOT_PASSWORD:-password}"
 ARGOCD_VERSION="v2.14.11"
 
 echo "============================================="
@@ -119,7 +118,7 @@ fi
 
 if [ "${ARGOCD_READY}" = "true" ]; then
   echo "[BONUS] Argo CD is already installed and ready."
-  kubectl apply -f "${CONFS_DIR}/argocd-ingress.yaml" 2>/dev/null || true
+  kubectl apply -f "${CONFS_DIR}/ingress.yaml" 2>/dev/null || true
 else
   echo "[BONUS] Installing Lightweight Argo CD..."
   kubectl apply -n "${ARGOCD_NS}" --server-side=true \
@@ -136,7 +135,7 @@ else
     --type merge -p '{"data": {"server.insecure": "true"}}' 2>/dev/null || true
 
   echo "[BONUS] Exposing Argo CD UI via Traefik Ingress..."
-  kubectl apply -f "${CONFS_DIR}/argocd-ingress.yaml"
+  kubectl apply -f "${CONFS_DIR}/ingress.yaml"
 
   echo "[BONUS] Waiting for Argo CD server to be ready..."
   kubectl rollout status deployment/argocd-server -n "${ARGOCD_NS}" --timeout=300s
@@ -390,5 +389,3 @@ echo "  1. Open GitLab: http://localhost:8181/root/playground"
 echo "  2. Edit deployment.yaml (e.g. change image tag v1 to v2)"
 echo "  3. Wait ~10s for Argo CD to auto-sync"
 echo "  4. Run: curl http://localhost:8888"
-echo ""
-echo "To clean up: bash ${SCRIPT_DIR}/cleanup.sh"
