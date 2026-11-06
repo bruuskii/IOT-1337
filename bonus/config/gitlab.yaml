@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gitlab-data
+  namespace: gitlab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitlab
+  namespace: gitlab
+  labels:
+    app: gitlab
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # REQUIRED: Prevents two pods from corrupting the same data volume
+  selector:
+    matchLabels:
+      app: gitlab
+  template:
+    metadata:
+      labels:
+        app: gitlab
+    spec:
+      containers:
+        - name: gitlab
+          image: gitlab/gitlab-ce:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          env:
+            - name: GITLAB_OMNIBUS_CONFIG
+              value: |
+                external_url 'http://localhost:8181'
+                gitlab_rails['nginx']['listen_port'] = 80
+                gitlab_rails['initial_root_password'] = 'password'
+
+                # Allow health probes from Kubelet without 403 Forbidden
+                gitlab_rails['monitoring_whitelist'] = ['0.0.0.0/0', '127.0.0.0/8']
+
+                # Disable heavy/unused features to save RAM
+                prometheus_monitoring['enable'] = false
+                registry['enable'] = false
+                mattermost['enable'] = false
+                gitlab_pages['enable'] = false
+                gitlab_kas['enable'] = false
+                letsencrypt['enable'] = false
+
+                # Minimal resource footprint
+                puma['worker_processes'] = 0
+                puma['min_threads'] = 1
+                puma['max_threads'] = 2
+                sidekiq['max_concurrency'] = 2
+                postgresql['shared_buffers'] = "256MB"
+                postgresql['max_connections'] = 100
+                postgresql['max_locks_per_transaction'] = 256
+                gitaly['ruby_max_rss'] = 100_000_000
+
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: 2
+              memory: 4Gi 
+
+          # Mount the persistent volume so data isn't lost on pod restart
+          volumeMounts:
+            - name: gitlab-storage
+              mountPath: /var/opt/gitlab
+            - name: gitlab-storage
+              mountPath: /etc/gitlab
+              subPath: etc-gitlab
+            - name: gitlab-storage
+              mountPath: /var/log/gitlab
+              subPath: log-gitlab
+
+          # Probe using public endpoint (bypasses 403 whitelist issue)
+          readinessProbe:
+            httpGet:
+              path: /users/sign_in
+              port: 80
+            initialDelaySeconds: 90
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60 # Allows up to 10 min for initial DB migrations
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitlab
+  namespace: gitlab
+  labels:
+    app: gitlab
+spec:
+  type: LoadBalancer
+  selector:
+    app: gitlab
+  ports:
+    - name: http
+      port: 8181
+      targetPort: 80

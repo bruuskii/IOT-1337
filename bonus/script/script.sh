@@ -1,30 +1,27 @@
 #!/bin/bash
 
-# Bonus - Setup K3d + Lightweight Argo CD + GitLab Omnibus + App
+# Bonus - Setup K3d + Lightweight Argo CD + GitLab Omnibus + Playground App
+#
+# Idempotent & Resumable:
+#   - Reuses existing cluster if already created
+#   - Detects existing images in cluster cache
+#   - Direct-streams large images via ctr (avoids k3d deadlock)
+#   - Skips already-healthy components (ArgoCD, GitLab, Repo, App)
+#   - Resumes seamlessly from the point of failure
 
 
-set -euo pipefail
-
-CLUSTER_NAME="iot-1337"
-GITLAB_name="gitlab"
+set -euo pipefail 
+-
+CLUSTER_NAME="iot"
 ARGOCD_NS="argocd"
 DEV_NS="dev"
-APP_NAME=""                                  # to check later
+GITLAB_NS="gitlab"
+APP_NAME="playground"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFS_DIR="${SCRIPT_DIR}/../config"
+CONFS_DIR="${SCRIPT_DIR}/../confs"
 
-GITLAB_ROOT_PASSWORD="${GITLAB_ROOT_PASSWORD:-password}"
+GITLAB_ROOT_PASSWORD="${GITLAB_ROOT_PASSWORD:password}"
 ARGOCD_VERSION="v2.14.11"
-
-# Helper: Extract JSON value safely
-get_json_val() {
-  local json="$1" key="$2"
-  if command -v jq &>/dev/null; then
-    echo "$json" | jq -r ".${key} // empty"
-  else
-    echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('${key}',''))" 2>/dev/null || echo ""
-  fi
-}
 
 echo "============================================="
 echo " [BONUS] Setting up K3d + Argo CD + GitLab   "
@@ -37,6 +34,9 @@ if k3d cluster list 2>/dev/null | grep -qw "${CLUSTER_NAME}"; then
   echo "[BONUS] K3d cluster '${CLUSTER_NAME}' already exists — reusing."
 else
   echo "[BONUS] Creating K3d cluster '${CLUSTER_NAME}'..."
+  # Port 8888 -> Application (wil42/playground uses port 8888)
+  # Port 8181 -> GitLab Web UI & HTTP Git
+  # Port 8080 -> Argo CD Web UI
   k3d cluster create "${CLUSTER_NAME}" \
     -p "8888:8888@loadbalancer" \
     -p "8181:8181@loadbalancer" \
@@ -71,15 +71,15 @@ else
   docker save gitlab/gitlab-ce:latest | docker exec -i "${NODE_CONTAINER}" ctr -n k8s.io images import -
   echo "[BONUS] GitLab image successfully loaded into cluster!"
 
-  if kubectl get pod -n "${GITLAB_name}" -l app=gitlab 2>/dev/null | grep -q "ContainerCreating"; then
+  if kubectl get pod -n "${GITLAB_NS}" -l app=gitlab 2>/dev/null | grep -q "ContainerCreating"; then
     echo "[BONUS] Restarting stuck GitLab pod..."
-    kubectl delete pod -n "${GITLAB_name}" -l app=gitlab --grace-period=0 --force 2>/dev/null || true
+    kubectl delete pod -n "${GITLAB_NS}" -l app=gitlab --grace-period=0 --force 2>/dev/null || true
   fi
 fi
 
-# Check and import smaller images
+# Check and import smaller images (ArgoCD, Redis, Playground)
 MISSING_IMAGES=()
-for img in "quay.io/argoproj/argocd:${ARGOCD_VERSION}" "redis:7.0.15-alpine" "0xakhi/portfolio:v1"; do
+for img in "quay.io/argoproj/argocd:${ARGOCD_VERSION}" "redis:7.0.15-alpine" "wil42/playground:v1"; do
   IMG_NAME=$(echo "$img" | cut -d: -f1)
   if ! image_in_cluster "${IMG_NAME}"; then
     MISSING_IMAGES+=("$img")
@@ -102,7 +102,7 @@ fi
 # 3. Create Namespaces
 
 echo "[BONUS] Ensuring namespaces exist..."
-for ns in "${ARGOCD_NS}" "${DEV_NS}" "${GITLAB_name}"; do
+for ns in "${ARGOCD_NS}" "${DEV_NS}" "${GITLAB_NS}"; do
   kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f -
 done
 
@@ -149,8 +149,8 @@ ARGOCD_PASSWORD=$(kubectl -n "${ARGOCD_NS}" get secret argocd-initial-admin-secr
 # 5. Deploy / Verify GitLab CE Omnibus
 
 GITLAB_READY=false
-if kubectl get deployment gitlab -n "${GITLAB_name}" &>/dev/null; then
-  GITLAB_REPLICAS=$(kubectl get deployment gitlab -n "${GITLAB_name}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+if kubectl get deployment gitlab -n "${GITLAB_NS}" &>/dev/null; then
+  GITLAB_REPLICAS=$(kubectl get deployment gitlab -n "${GITLAB_NS}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
   if [ "${GITLAB_REPLICAS:-0}" -ge 1 ]; then
     if curl -s -L -o /dev/null -w "%{http_code}" --max-time 5 "http://localhost:8181/users/sign_in" | grep -qE "200|302"; then
       GITLAB_READY=true
@@ -165,7 +165,7 @@ else
   kubectl apply -f "${CONFS_DIR}/gitlab.yaml"
 
   echo "[BONUS] Waiting for GitLab to become ready..."
-  kubectl rollout status deployment/gitlab -n "${GITLAB_name}" --timeout=900s
+  kubectl rollout status deployment/gitlab -n "${GITLAB_NS}" --timeout=900s
 
   echo "[BONUS] Verifying GitLab HTTP service..."
   for i in $(seq 1 40); do
@@ -182,7 +182,7 @@ fi
 # 6. Ensure GitLab Token + Project + Manifests
 
 echo "[BONUS] Ensuring GitLab API access token..."
-RAW_TOKEN_OUTPUT=$(kubectl exec -n "${GITLAB_name}" deploy/gitlab -- \
+RAW_TOKEN_OUTPUT=$(kubectl exec -n "${GITLAB_NS}" deploy/gitlab -- \
   gitlab-rails runner "
     user = User.find_by_username('root')
     user.personal_access_tokens.where(name: 'iot-automation').destroy_all
@@ -203,7 +203,7 @@ fi
 if [ -z "${GITLAB_TOKEN}" ]; then
   echo "[BONUS] Retrying token creation in 5s..."
   sleep 5
-  RAW_TOKEN_OUTPUT=$(kubectl exec -n "${GITLAB_name}" deploy/gitlab -- \
+  RAW_TOKEN_OUTPUT=$(kubectl exec -n "${GITLAB_NS}" deploy/gitlab -- \
     gitlab-rails runner "
       user = User.find_by_username('root')
       user.personal_access_tokens.where(name: 'iot-automation').destroy_all
@@ -226,23 +226,23 @@ if [ -z "${GITLAB_TOKEN}" ]; then
 fi
 echo "[BONUS] GitLab API access token verified."
 
-# Check if project exists
-PROJECT_RESP=$(curl -s --max-time 10 "http://127.0.0.1:8181/api/v4/projects/root%2Fportfolio" \
+# Check if project 'playground' already exists in GitLab
+PROJECT_RESP=$(curl -s --max-time 10 "http://127.0.0.1:8181/api/v4/projects/root%2Fplayground" \
   -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" 2>/dev/null || echo "")
-PROJECT_ID=$(get_json_val "${PROJECT_RESP}" "id")
+PROJECT_ID=$(echo "${PROJECT_RESP}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
 
 if [ -z "${PROJECT_ID}" ]; then
-  echo "[BONUS] Creating GitLab project 'portfolio'..."
+  echo "[BONUS] Creating GitLab project 'playground'..."
   for attempt in 1 2 3; do
     CREATE_RESP=$(curl -s --max-time 15 -X POST "http://127.0.0.1:8181/api/v4/projects" \
       -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
       -H "Content-Type: application/json" \
       -d '{
-        "name": "portfolio",
+        "name": "playground",
         "visibility": "public",
         "initialize_with_readme": true
       }' 2>/dev/null || echo "")
-    PROJECT_ID=$(get_json_val "${CREATE_RESP}" "id")
+    PROJECT_ID=$(echo "${CREATE_RESP}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
     if [ -n "${PROJECT_ID}" ]; then
       break
     fi
@@ -251,16 +251,17 @@ if [ -z "${PROJECT_ID}" ]; then
   done
   
   if [ -z "${PROJECT_ID}" ]; then
-    PROJECT_RESP=$(curl -s --max-time 10 "http://127.0.0.1:8181/api/v4/projects/root%2Fportfolio" \
+    # Final fallback check if created despite response error
+    PROJECT_RESP=$(curl -s --max-time 10 "http://127.0.0.1:8181/api/v4/projects/root%2Fplayground" \
       -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" 2>/dev/null || echo "")
-    PROJECT_ID=$(get_json_val "${PROJECT_RESP}" "id")
+    PROJECT_ID=$(echo "${PROJECT_RESP}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "1")
   fi
-  echo "[BONUS] Created GitLab project 'portfolio' (ID: ${PROJECT_ID})."
+  echo "[BONUS] Created GitLab project 'playground' (ID: ${PROJECT_ID})."
 else
-  echo "[BONUS] GitLab project 'portfolio' already exists (ID: ${PROJECT_ID})."
+  echo "[BONUS] GitLab project 'playground' already exists (ID: ${PROJECT_ID})."
 fi
 
-# Sync deployment.yaml
+# Check if deployment.yaml already exists in project repository
 echo "[BONUS] Synchronizing deployment.yaml in GitLab repository..."
 FILE_EXISTS_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
   "http://127.0.0.1:8181/api/v4/projects/${PROJECT_ID}/repository/files/deployment.yaml?ref=main" \
@@ -273,7 +274,7 @@ with open(sys.argv[1]) as f:
 payload = {
     'branch': 'main',
     'content': content,
-    'commit_message': 'Synchronize portfolio deployment manifests'
+    'commit_message': 'Synchronize playground deployment manifests'
 }
 print(json.dumps(payload))
 " "${CONFS_DIR}/deployment.yaml")
@@ -298,7 +299,6 @@ fi
 # 7. Configure Argo CD Repo Credentials & Application
 
 echo "[BONUS] Configuring Argo CD repository credentials..."
-# FIXED URL: using internal k8s DNS and standard port 8181 (or 80 depending on your Service)
 kubectl apply -n "${ARGOCD_NS}" -f - <<EOF
 apiVersion: v1
 kind: Secret
@@ -310,10 +310,14 @@ metadata:
 type: Opaque
 stringData:
   type: git
-  url: http://gitlab.gitlab.svc.cluster.local:8181/root/portfolio.git
+  url: http://gitlab.gitlab.svc.cluster.local:8181/root/playground.git
   username: root
   password: ${GITLAB_TOKEN}
 EOF
+
+# Force refresh so repo-server picks up the credentials immediately
+kubectl patch application "${APP_NAME}" -n "${ARGOCD_NS}" \
+  --type merge -p '{"metadata": {"annotations": {"argocd.argoproj.io/refresh": "hard"}}}' 2>/dev/null || true
 
 SYNC=$(kubectl get application "${APP_NAME}" -n "${ARGOCD_NS}" \
   -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "")
@@ -341,10 +345,12 @@ else
   done
 fi
 
+
 # Summary
+
 echo ""
 echo "============================================="
-echo "                  [BONUS]            "
+echo "         [BONUS] Setup Complete!             "
 echo "============================================="
 echo ""
 echo "  GitLab UI:   http://localhost:8181"
@@ -358,15 +364,31 @@ echo ""
 echo "  App:         http://localhost:8888"
 echo ""
 
-echo "── Namespaces ──"
+echo " Namespaces"
 kubectl get ns
 echo ""
-echo "── GitLab Pods ──"
-kubectl get pods -n "${GITLAB_name}"
+echo " GitLab Pods "
+kubectl get pods -n "${GITLAB_NS}"
 echo ""
-echo "── Argo CD Pods ──"
+echo " Argo CD Pods "
 kubectl get pods -n "${ARGOCD_NS}"
 echo ""
-echo "── App Pods ──"
+echo " App Pods "
 kubectl get pods -n "${DEV_NS}"
 echo ""
+
+echo "[BONUS] Testing app on http://localhost:8888..."
+sleep 2
+if curl -s --max-time 5 http://localhost:8888/ >/dev/null 2>&1; then
+  echo "[BONUS] App is responding on http://localhost:8888!"
+else
+  echo "[BONUS] App not responding yet  give it a few seconds to start."
+fi
+echo ""
+echo "To test the GitOps loop:"
+echo "  1. Open GitLab: http://localhost:8181/root/playground"
+echo "  2. Edit deployment.yaml (e.g. change image tag v1 to v2)"
+echo "  3. Wait ~10s for Argo CD to auto-sync"
+echo "  4. Run: curl http://localhost:8888"
+echo ""
+echo "To clean up: bash ${SCRIPT_DIR}/cleanup.sh"
