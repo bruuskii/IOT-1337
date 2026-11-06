@@ -4,11 +4,14 @@
 LOGIN     = "izouine"
 SERVER_IP = "192.168.56.110"
 
-# Official Rocky Linux box, published by the distribution itself.
-BOX_NAME   = "rockylinux-10.2-official"
-BOX_URL    = "https://dl.rockylinux.org/pub/rocky/10/images/x86_64/" \
-             "Rocky-10-Vagrant-Vbox-10.2-20260525.0.x86_64.vagrant.virtualbox.box"
-BOX_SHA256 = "5bd6cb282523eece1923d23e3c22dd7cb875b8d9df72c395d77a8d9e48f2bbc9"
+# Official Fedora Cloud box, published by the distribution itself (not the
+# HashiCorp registry). The checksum pins the exact image that was validated.
+# Fedora targets baseline x86-64, so it boots under nested virtualization even
+# when the CPU features required by EL10 (x86-64-v3: FMA, F16C) are hidden.
+BOX_NAME   = "fedora-45-cloud-official"
+BOX_URL    = "https://download.fedoraproject.org/pub/fedora/linux/releases/45/Cloud/" \
+             "x86_64/images/Fedora-Cloud-Base-Vagrant-VirtualBox-45-1.4.x86_64.vagrant.virtualbox.box"
+BOX_SHA256 = "19635c83a2b4f78b9cc04ac57aee9677f96ea5cb4f88938b9374b82d92c0bfa8"
 
 CONFS_DEST = "/tmp/p2-confs"
 
@@ -22,14 +25,41 @@ Vagrant.configure("2") do |config|
   # No Guest Additions in the official box: files are uploaded over SSH.
   config.vm.synced_folder ".", "/vagrant", disabled: true
 
+  # Vagrant gives the private interface a gateway (192.168.56.1) whose route
+  # outranks the NAT one, cutting the VM off from the internet. Keep the
+  # private network for cluster traffic only. Runs before the node scripts.
+  config.vm.provision "shell", name: "private-net-no-default-route", inline: <<-SHELL
+    set -eu
+    # Vagrant writes the connection file via /tmp, so it keeps a tmp SELinux
+    # label and NetworkManager may not rewrite it: restore the right label.
+    restorecon -R /etc/NetworkManager/system-connections 2>/dev/null || true
+    for dev in $(nmcli -g DEVICE,TYPE dev | awk -F: '$2=="ethernet"{print $1}'); do
+      ip -4 addr show "$dev" | grep -q 'inet 192\.168\.56\.' || continue
+      con=$(nmcli -g GENERAL.CONNECTION dev show "$dev")
+      nmcli con modify "$con" ipv4.gateway "" ipv4.never-default yes
+      nmcli con up "$con" >/dev/null
+    done
+    curl -sfI --max-time 15 https://get.k3s.io >/dev/null || { echo "No internet access from the VM" >&2; exit 1; }
+  SHELL
+
   config.vm.define "#{LOGIN}S" do |server|
     server.vm.hostname = "#{LOGIN}S"
     server.vm.network "private_network", ip: SERVER_IP
 
     server.vm.provider "virtualbox" do |vb|
       vb.name   = "#{LOGIN}S"
-      vb.cpus   = 1
-      vb.memory = 1024
+      # One CPU is not enough under nested virtualization: K3s plus three
+      # apps and Traefik time out their health checks and restart in loops.
+      vb.cpus   = 2
+      # 1024 MB is not enough here: K3s, Traefik and the five app pods swap
+      # ~600 MB and the API stops answering. p1 (no apps) stays at 1024 MB.
+      vb.memory = 2048
+      # The box declares "Other Linux", which leaves the I/O APIC off.
+      # Under nested virtualization that makes interrupts costly enough to starve
+      # K3s on a single CPU. The KVM paravirtual clock is kept off: nested, it
+      # returns garbage time and the kernel hangs at boot.
+      vb.customize ["modifyvm", :id, "--ostype", "Fedora_64",
+                    "--paravirtprovider", "none", "--ioapic", "on"]
     end
 
     # Re-uploading a directory nests it, so clear the target first.

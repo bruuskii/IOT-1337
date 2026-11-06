@@ -21,10 +21,15 @@ curl -sfL https://get.k3s.io | sh -s - server \
   --node-ip "$NODE_IP" \
   --advertise-address "$NODE_IP" \
   --flannel-iface "$IFACE" \
-  --write-kubeconfig-mode 644
+  --write-kubeconfig-mode 644 \
+  --disable metrics-server
+# Traefik stays (it serves the Ingress); the metrics server is not used here
+# and dropping it keeps K3s and the three apps inside 1024 MB.
 
-until $KUBECTL get node "$(hostname)" >/dev/null 2>&1; do sleep 2; done
-$KUBECTL wait --for=condition=Ready node/"$(hostname)" --timeout=180s
+# Kubernetes stores node names in lowercase (izouineS -> izouines).
+NODE_NAME=$(hostname | tr "[:upper:]" "[:lower:]")
+until $KUBECTL get node "$NODE_NAME" >/dev/null 2>&1; do sleep 2; done
+$KUBECTL wait --for=condition=Ready node/"$NODE_NAME" --timeout=300s
 
 echo "Deploying the three applications and the Ingress..."
 $KUBECTL apply -f "$CONFS_DIR"

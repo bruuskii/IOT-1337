@@ -23,11 +23,17 @@ curl -sfL https://get.k3s.io | K3S_TOKEN="$K3S_TOKEN" sh -s - server \
   --node-ip "$NODE_IP" \
   --advertise-address "$NODE_IP" \
   --flannel-iface "$IFACE" \
-  --write-kubeconfig-mode 644
+  --write-kubeconfig-mode 644 \
+  --disable traefik \
+  --disable metrics-server
+# Part 1 serves no application: dropping the ingress controller and the
+# metrics server keeps the control plane inside 1024 MB without swapping.
 
 echo "Waiting for the node to be Ready..."
-until /usr/local/bin/kubectl get node "$(hostname)" >/dev/null 2>&1; do sleep 2; done
-/usr/local/bin/kubectl wait --for=condition=Ready node/"$(hostname)" --timeout=180s
+# Kubernetes stores node names in lowercase (izouineS -> izouines).
+NODE_NAME=$(hostname | tr "[:upper:]" "[:lower:]")
+until /usr/local/bin/kubectl get node "$NODE_NAME" >/dev/null 2>&1; do sleep 2; done
+/usr/local/bin/kubectl wait --for=condition=Ready node/"$NODE_NAME" --timeout=300s
 
 # Short alias used during the defense.
 echo "alias k=kubectl" > /etc/profile.d/kubectl-alias.sh
