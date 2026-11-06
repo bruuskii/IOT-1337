@@ -6,9 +6,10 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/bruuskii/IOT-1337.git
+    # Public GitHub repository; its name contains the login (izouine).
+    repoURL: https://github.com/bruuskii/IOT-izouine.git
     targetRevision: main
-    path: p3/manifests
+    path: p3/confs/app
   destination:
     server: https://kubernetes.default.svc
     namespace: dev
@@ -16,3 +17,5 @@ spec:
     automated:
       prune: true
       selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

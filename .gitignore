@@ -1,0 +1,6 @@
+# Vagrant state (VM ids, generated K3s token) is local to each machine.
+.vagrant/
+# macOS / editor noise
+.DS_Store
+*.swp
+*.log

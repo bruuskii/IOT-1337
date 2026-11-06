@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-one
+  labels:
+    app: app-one
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-one
+  template:
+    metadata:
+      labels:
+        app: app-one
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.28-alpine
+          env:
+            - name: APP_NAME
+              value: app1
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: page
+              mountPath: /etc/nginx/templates
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: page
+          configMap:
+            name: hello-page
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-one
+spec:
+  selector:
+    app: app-one
+  ports:
+    - port: 80
+      targetPort: 80

@@ -22,10 +22,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: playground-service
+  name: playground
   namespace: dev
 spec:
-  type: ClusterIP
+  # k3d's load balancer forwards localhost:8888 on the VM to this port.
+  type: LoadBalancer
   selector:
     app: playground
   ports:

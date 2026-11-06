@@ -1,13 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Bonus - Setup K3d + Lightweight Argo CD + GitLab Omnibus + Playground App
+# Bonus - K3d + Argo CD + local GitLab CE (namespace "gitlab") + playground app.
 #
-# Idempotent & Resumable:
-#   - Reuses existing cluster if already created
-#   - Detects existing images in cluster cache
-#   - Direct-streams large images via ctr (avoids k3d deadlock)
-#   - Skips already-healthy components (ArgoCD, GitLab)
-#   - Resumes seamlessly from the point of failure
+# Same GitOps loop as Part 3, but Argo CD watches a repository hosted on the
+# local GitLab instead of GitHub. Safe to re-run: existing pieces are reused.
 
 set -euo pipefail
 
@@ -16,119 +12,61 @@ ARGOCD_NS="argocd"
 DEV_NS="dev"
 GITLAB_NS="gitlab"
 APP_NAME="playground"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFS_DIR="${SCRIPT_DIR}/../confs"
-# GitLab rejects short or common passwords for root: keep this strong.
-GITLAB_ROOT_PASSWORD="${GITLAB_ROOT_PASSWORD:-IoT-Gitlab-2026!}"
-ARGOCD_VERSION="v2.14.11"
-GITLAB_API="http://127.0.0.1:8181/api/v4"
+# GitLab rejects weak root passwords (common ones, or containing "gitlab",
+# "root", "admin"...): the first boot would then not set it. Keep it strong.
+GITLAB_ROOT_PASSWORD="${GITLAB_ROOT_PASSWORD:-Inc3ption-0f-Th1ngs-42}"
+ARGOCD_VERSION="v3.5.6"
+GITLAB_URL="http://localhost:8181"
+REPO_URL_HOST="${GITLAB_URL}/root/${APP_NAME}.git"
+REPO_URL_CLUSTER="http://gitlab.${GITLAB_NS}.svc.cluster.local:8181/root/${APP_NAME}.git"
 
 echo "============================================="
 echo " [BONUS] Setting up K3d + Argo CD + GitLab   "
 echo "============================================="
 
 
-# 0. Prerequisites
+# 0. Prerequisites (Docker, git, kubectl, k3d)
 
-for tool in docker curl python3; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "[BONUS] Error: '$tool' is required. Install it first (see p3/scripts)."
-    exit 1
-  fi
-done
+"${SCRIPT_DIR}/install-tools.sh"
 
+# A user just added to the docker group only gets it in a new login session.
 if ! docker info >/dev/null 2>&1; then
-  echo "[BONUS] Error: Docker is installed but not running (or you lack permission)."
+  if [ -z "${IOT_SG_REEXEC:-}" ] && getent group docker | grep -qw "$(id -un)"; then
+    export IOT_SG_REEXEC=1
+    exec sg docker -c "$(printf '%q ' bash "${BASH_SOURCE[0]}" "$@")"
+  fi
+  echo "[BONUS] Error: cannot reach the Docker daemon."
   exit 1
 fi
 
-if ! command -v k3d >/dev/null 2>&1; then
-  echo "[BONUS] Installing k3d..."
-  curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
-fi
-
-if ! command -v kubectl >/dev/null 2>&1; then
-  echo "[BONUS] Installing kubectl..."
-  KUBECTL_VERSION="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
-  ARCH="$(uname -m)"; case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; esac
-  curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl"
-  sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-  rm -f /tmp/kubectl
+# Part 3's cluster publishes port 8888 too: the bonus cluster replaces it.
+if k3d cluster get iot-p3 >/dev/null 2>&1; then
+  echo "[BONUS] Deleting the Part 3 cluster 'iot-p3' (port 8888 is needed here)..."
+  k3d cluster delete iot-p3
 fi
 
 
-# 1. Ensure K3d cluster exists
+# 1. K3d cluster
 
-if k3d cluster list 2>/dev/null | grep -qw "${CLUSTER_NAME}"; then
-  echo "[BONUS] K3d cluster '${CLUSTER_NAME}' already exists — reusing."
+if k3d cluster get "${CLUSTER_NAME}" >/dev/null 2>&1; then
+  echo "[BONUS] K3d cluster '${CLUSTER_NAME}' already exists, reusing it."
+  k3d kubeconfig merge "${CLUSTER_NAME}" --kubeconfig-switch-context >/dev/null
 else
   echo "[BONUS] Creating K3d cluster '${CLUSTER_NAME}'..."
-  # Port 8888 -> Application (wil42/playground uses port 8888)
-  # Port 8181 -> GitLab Web UI & HTTP Git
-  # Port 8080 -> Argo CD Web UI (through Traefik)
+  # 8888 -> playground app, 8181 -> GitLab (UI + git over HTTP),
+  # 8080 -> Traefik (Argo CD UI).
   k3d cluster create "${CLUSTER_NAME}" \
     -p "8888:8888@loadbalancer" \
     -p "8181:8181@loadbalancer" \
     -p "8080:80@loadbalancer" \
     --wait
 fi
-
-echo "[BONUS] Verifying cluster node readiness..."
-kubectl wait --for=condition=ready node --all --timeout=60s
+kubectl wait --for=condition=Ready node --all --timeout=180s
 
 
-# 2. Resumable Image Loading into K3d
-
-echo "[BONUS] Checking container images inside cluster..."
-NODE_CONTAINER="k3d-${CLUSTER_NAME}-server-0"
-
-# Function to check if image exists in cluster
-image_in_cluster() {
-  local img_name="$1"
-  docker exec -i "${NODE_CONTAINER}" sh -c 'crictl images 2>/dev/null || ctr -n k8s.io images list 2>/dev/null' | grep -q "${img_name}"
-}
-
-if image_in_cluster "gitlab/gitlab-ce"; then
-  echo "[BONUS] GitLab image already present inside cluster."
-else
-  echo "[BONUS] GitLab image missing from cluster. Preparing import..."
-  if ! docker image inspect "gitlab/gitlab-ce:latest" &>/dev/null; then
-    echo "[BONUS] Pulling gitlab/gitlab-ce:latest to host first..."
-    docker pull gitlab/gitlab-ce:latest
-  fi
-  echo "[BONUS] Direct-streaming gitlab/gitlab-ce into cluster..."
-  docker save gitlab/gitlab-ce:latest | docker exec -i "${NODE_CONTAINER}" ctr -n k8s.io images import -
-  echo "[BONUS] GitLab image successfully loaded into cluster!"
-
-  if kubectl get pod -n "${GITLAB_NS}" -l app=gitlab 2>/dev/null | grep -q "ContainerCreating"; then
-    echo "[BONUS] Restarting stuck GitLab pod..."
-    kubectl delete pod -n "${GITLAB_NS}" -l app=gitlab --grace-period=0 --force 2>/dev/null || true
-  fi
-fi
-
-# Check and import smaller images (ArgoCD, Redis, Playground)
-MISSING_IMAGES=()
-for img in "quay.io/argoproj/argocd:${ARGOCD_VERSION}" "redis:7.0.15-alpine" "wil42/playground:v1"; do
-  IMG_NAME=$(echo "$img" | cut -d: -f1)
-  if ! image_in_cluster "${IMG_NAME}"; then
-    MISSING_IMAGES+=("$img")
-  fi
-done
-
-if [ ${#MISSING_IMAGES[@]} -gt 0 ]; then
-  echo "[BONUS] Importing missing helper images into K3d: ${MISSING_IMAGES[*]}"
-  for img in "${MISSING_IMAGES[@]}"; do
-    if ! docker image inspect "$img" &>/dev/null; then
-      docker pull "$img" || true
-    fi
-  done
-  k3d image import "${MISSING_IMAGES[@]}" -c "${CLUSTER_NAME}" || true
-else
-  echo "[BONUS] All helper images are already loaded in cluster."
-fi
-
-
-# 3. Create Namespaces
+# 2. Namespaces
 
 echo "[BONUS] Ensuring namespaces exist..."
 for ns in "${ARGOCD_NS}" "${DEV_NS}" "${GITLAB_NS}"; do
@@ -136,198 +74,101 @@ for ns in "${ARGOCD_NS}" "${DEV_NS}" "${GITLAB_NS}"; do
 done
 
 
-# 4. Install / Verify Argo CD
+# 3. GitLab CE (started first: its first boot is by far the longest step)
 
-ARGOCD_READY=false
-if kubectl get deployment argocd-server -n "${ARGOCD_NS}" &>/dev/null; then
-  READY_REPLICAS=$(kubectl get deployment argocd-server -n "${ARGOCD_NS}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-  if [ "${READY_REPLICAS:-0}" -ge 1 ]; then
-    ARGOCD_READY=true
-  fi
-fi
+kubectl create secret generic gitlab-root-password -n "${GITLAB_NS}" \
+  --from-literal=password="${GITLAB_ROOT_PASSWORD}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+echo "[BONUS] Applying GitLab deployment..."
+kubectl apply -f "${CONFS_DIR}/gitlab.yaml"
 
-if [ "${ARGOCD_READY}" = "true" ]; then
-  echo "[BONUS] Argo CD is already installed and ready."
-  kubectl apply -f "${CONFS_DIR}/ingress.yaml"
+
+# 4. Argo CD (installed while GitLab boots)
+
+if kubectl get deployment argocd-server -n "${ARGOCD_NS}" >/dev/null 2>&1; then
+  echo "[BONUS] Argo CD is already installed."
 else
-  echo "[BONUS] Installing Lightweight Argo CD..."
+  echo "[BONUS] Installing Argo CD ${ARGOCD_VERSION}..."
   kubectl apply -n "${ARGOCD_NS}" --server-side --force-conflicts \
     -f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml"
 
-  echo "[BONUS] Scaling down unneeded Argo CD components..."
-  kubectl scale deployment -n "${ARGOCD_NS}" argocd-dex-server --replicas=0 2>/dev/null || true
-  kubectl scale deployment -n "${ARGOCD_NS}" argocd-notifications-controller --replicas=0 2>/dev/null || true
-  kubectl scale deployment -n "${ARGOCD_NS}" argocd-applicationset-controller --replicas=0 2>/dev/null || true
+  # Not needed here; frees memory for GitLab.
+  kubectl scale deployment -n "${ARGOCD_NS}" --replicas=0 \
+    argocd-dex-server argocd-notifications-controller argocd-applicationset-controller
 
-  kubectl patch configmap argocd-cm -n "${ARGOCD_NS}" \
-    --type merge -p '{"data": {"timeout.reconciliation": "10s"}}'
+  # Poll Git every ~10s instead of every 2-3 min.
+  kubectl patch configmap argocd-cm -n "${ARGOCD_NS}" --type merge \
+    -p '{"data": {"timeout.reconciliation": "10s", "timeout.reconciliation.jitter": "0s"}}'
   # Serve plain HTTP behind Traefik (otherwise the UI loops on redirects).
-  kubectl patch configmap argocd-cmd-params-cm -n "${ARGOCD_NS}" \
-    --type merge -p '{"data": {"server.insecure": "true"}}'
+  kubectl patch configmap argocd-cmd-params-cm -n "${ARGOCD_NS}" --type merge \
+    -p '{"data": {"server.insecure": "true"}}'
   # Config maps are only read at startup: restart so both patches apply.
   kubectl rollout restart deployment/argocd-server deployment/argocd-repo-server -n "${ARGOCD_NS}"
   kubectl rollout restart statefulset/argocd-application-controller -n "${ARGOCD_NS}"
-
-  echo "[BONUS] Exposing Argo CD UI via Traefik Ingress..."
-  kubectl apply -f "${CONFS_DIR}/ingress.yaml"
-
-  echo "[BONUS] Waiting for Argo CD server to be ready..."
-  kubectl rollout status deployment/argocd-server -n "${ARGOCD_NS}" --timeout=300s
 fi
+kubectl apply -f "${CONFS_DIR}/ingress.yaml"
 
-ARGOCD_PASSWORD=$(kubectl -n "${ARGOCD_NS}" get secret argocd-initial-admin-secret \
-  -o jsonpath="{.data.password}" 2>/dev/null | base64 -d || echo "admin")
-
-
-# 5. Deploy / Verify GitLab CE Omnibus
-
-gitlab_http_ok() {
-  curl -s -L -o /dev/null -w "%{http_code}" --max-time 5 "http://localhost:8181/users/sign_in" | grep -qE "200|302"
-}
-
-GITLAB_READY=false
-if kubectl get deployment gitlab -n "${GITLAB_NS}" &>/dev/null; then
-  GITLAB_REPLICAS=$(kubectl get deployment gitlab -n "${GITLAB_NS}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-  if [ "${GITLAB_REPLICAS:-0}" -ge 1 ] && gitlab_http_ok; then
-    GITLAB_READY=true
-  fi
-fi
-
-if [ "${GITLAB_READY}" = "true" ]; then
-  echo "[BONUS] GitLab CE is already running and responsive on port 8181."
-else
-  # Root password consumed by gitlab.yaml (only used on the very first boot).
-  kubectl create secret generic gitlab-root-password -n "${GITLAB_NS}" \
-    --from-literal=password="${GITLAB_ROOT_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-
-  echo "[BONUS] Applying GitLab deployment..."
-  kubectl apply -f "${CONFS_DIR}/gitlab.yaml"
-
-  echo "[BONUS] Waiting for GitLab to become ready (first boot takes several minutes)..."
-  kubectl rollout status deployment/gitlab -n "${GITLAB_NS}" --timeout=900s
-
-  echo "[BONUS] Verifying GitLab HTTP service..."
-  for i in $(seq 1 40); do
-    if gitlab_http_ok; then
-      echo "[BONUS] GitLab Web UI is up!"
-      break
-    fi
-    if [ "$i" -eq 40 ]; then
-      echo "[BONUS] Error: GitLab is not answering on http://localhost:8181."
-      exit 1
-    fi
-    echo "  Waiting for GitLab HTTP response... (${i}/40)"
-    sleep 3
-  done
-fi
-
-
-# 6. Ensure GitLab Token + Project + Manifests
-
-json_get() {
-  # Print one top-level key of a JSON document read on stdin (empty if absent).
-  python3 -c "import sys,json; print(json.load(sys.stdin).get(sys.argv[1],''))" "$1" 2>/dev/null || true
-}
-
-create_gitlab_token() {
-  kubectl exec -n "${GITLAB_NS}" deploy/gitlab -- gitlab-rails runner "
-    user = User.find_by_username('root')
-    user.personal_access_tokens.where(name: 'iot-automation').destroy_all
-    token = user.personal_access_tokens.create!(
-      name: 'iot-automation',
-      scopes: [:api, :read_repository, :write_repository],
-      expires_at: 365.days.from_now
-    )
-    puts \"TOKEN_DELIM_START:#{token.token}:TOKEN_DELIM_END\"
-  " 2>/dev/null | sed -n 's/.*TOKEN_DELIM_START:\(.*\):TOKEN_DELIM_END.*/\1/p' | tr -d '\r\n[:space:]' || true
-}
-
-echo "[BONUS] Ensuring GitLab API access token..."
-GITLAB_TOKEN=""
-for attempt in 1 2 3; do
-  GITLAB_TOKEN="$(create_gitlab_token)"
-  [ -n "${GITLAB_TOKEN}" ] && break
-  echo "  Token creation failed, retrying in 10s... (${attempt}/3)"
-  sleep 10
+echo "[BONUS] Waiting for Argo CD..."
+for res in deployment/argocd-server deployment/argocd-repo-server statefulset/argocd-application-controller; do
+  kubectl rollout status "$res" -n "${ARGOCD_NS}" --timeout=600s
 done
 
-if [ -z "${GITLAB_TOKEN}" ]; then
-  echo "[BONUS] Error: Failed to generate GitLab personal access token."
-  exit 1
-fi
-echo "[BONUS] GitLab API access token verified."
+ARGOCD_PASSWORD=$(kubectl -n "${ARGOCD_NS}" get secret argocd-initial-admin-secret \
+  -o jsonpath='{.data.password}' | base64 -d)
 
-get_project_id() {
-  curl -s --max-time 10 "${GITLAB_API}/projects/root%2Fplayground" \
-    -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" | json_get id
+
+# 5. Wait for GitLab
+
+echo "[BONUS] Waiting for GitLab (first boot: image pull + migrations, 10-20 min)..."
+kubectl rollout status deployment/gitlab -n "${GITLAB_NS}" --timeout=1800s
+
+gitlab_http_ok() {
+  curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${GITLAB_URL}/users/sign_in" | grep -q "^200$"
 }
+for i in $(seq 1 60); do
+  gitlab_http_ok && break
+  if [ "$i" -eq 60 ]; then
+    echo "[BONUS] Error: GitLab is not answering on ${GITLAB_URL}."
+    exit 1
+  fi
+  echo "  Waiting for GitLab HTTP... (${i}/60)"
+  sleep 5
+done
+echo "[BONUS] GitLab is up on ${GITLAB_URL}."
 
-PROJECT_ID="$(get_project_id)"
 
-if [ -z "${PROJECT_ID}" ]; then
-  echo "[BONUS] Creating GitLab project 'playground'..."
-  for attempt in 1 2 3; do
-    PROJECT_ID=$(curl -s --max-time 15 -X POST "${GITLAB_API}/projects" \
-      -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
-      -H "Content-Type: application/json" \
-      -d '{
-        "name": "playground",
-        "visibility": "public",
-        "default_branch": "main",
-        "initialize_with_readme": true
-      }' | json_get id)
-    [ -n "${PROJECT_ID}" ] && break
-    # The project may have been created even if the response was lost.
-    PROJECT_ID="$(get_project_id)"
-    [ -n "${PROJECT_ID}" ] && break
-    echo "  Retrying project creation in 5s... (${attempt}/3)"
-    sleep 5
+# 6. GitLab repository root/playground, seeded with the v1 manifest
+#    (GitLab creates the project on the first push to a new path).
+
+# Authenticate git as root without writing the password in any URL or file.
+GIT_AUTH=(-c "http.extraHeader=Authorization: Basic $(printf '%s' "root:${GITLAB_ROOT_PASSWORD}" | base64 -w0)")
+
+if git "${GIT_AUTH[@]}" ls-remote --exit-code "${REPO_URL_HOST}" refs/heads/main >/dev/null 2>&1; then
+  # Never overwrite a version changed during the defense.
+  echo "[BONUS] GitLab repository root/${APP_NAME} already exists, keeping its content."
+else
+  echo "[BONUS] Creating GitLab repository root/${APP_NAME} (v1)..."
+  SEED_DIR="$(mktemp -d)"
+  trap 'rm -rf "${SEED_DIR}"' EXIT
+  cp "${CONFS_DIR}/deployment.yaml" "${SEED_DIR}/deployment.yaml"
+  git -C "${SEED_DIR}" init -q -b main
+  git -C "${SEED_DIR}" add deployment.yaml
+  git -C "${SEED_DIR}" -c user.name="Administrator" -c user.email="admin@example.com" \
+    commit -q -m "Add playground deployment (v1)"
+  for i in $(seq 1 10); do
+    git -C "${SEED_DIR}" "${GIT_AUTH[@]}" push -q "${REPO_URL_HOST}" main && break
+    if [ "$i" -eq 10 ]; then
+      echo "[BONUS] Error: cannot push to ${REPO_URL_HOST} (wrong root password?)."
+      exit 1
+    fi
+    echo "  Push failed, retrying in 10s... (${i}/10)"
+    sleep 10
   done
-
-  if [ -z "${PROJECT_ID}" ]; then
-    echo "[BONUS] Error: could not create or find GitLab project 'playground'."
-    exit 1
-  fi
-  echo "[BONUS] Created GitLab project 'playground' (ID: ${PROJECT_ID})."
-else
-  echo "[BONUS] GitLab project 'playground' already exists (ID: ${PROJECT_ID})."
-fi
-
-# Push deployment.yaml to the repository root (argocd-app.yaml uses path ".").
-# Only on first setup: never overwrite a version changed during the defense.
-echo "[BONUS] Ensuring deployment.yaml exists in GitLab repository..."
-FILE_URL="${GITLAB_API}/projects/${PROJECT_ID}/repository/files/deployment.yaml"
-FILE_EXISTS_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
-  "${FILE_URL}?ref=main" -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" || echo "000")
-
-if [ "${FILE_EXISTS_CODE}" = "200" ]; then
-  echo "[BONUS] deployment.yaml already in GitLab repository — keeping its current version."
-else
-  FILE_PAYLOAD=$(python3 -c "
-import json, sys
-with open(sys.argv[1]) as f:
-    content = f.read()
-print(json.dumps({
-    'branch': 'main',
-    'content': content,
-    'commit_message': 'Add playground deployment manifests (v1)'
-}))
-" "${CONFS_DIR}/deployment.yaml")
-
-  PUSH_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 -X POST "${FILE_URL}" \
-    -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d "${FILE_PAYLOAD}" || echo "000")
-  if [ "${PUSH_CODE}" != "201" ]; then
-    echo "[BONUS] Error: failed to push deployment.yaml to GitLab (HTTP ${PUSH_CODE})."
-    exit 1
-  fi
-  echo "[BONUS] deployment.yaml pushed to GitLab repository."
+  echo "[BONUS] Repository created and seeded."
 fi
 
 
-# 7. Configure Argo CD Repo Credentials & Application
+# 7. Argo CD: repository credentials + Application
 
 echo "[BONUS] Configuring Argo CD repository credentials..."
 kubectl apply -n "${ARGOCD_NS}" -f - <<EOF
@@ -341,27 +182,25 @@ metadata:
 type: Opaque
 stringData:
   type: git
-  url: http://gitlab.gitlab.svc.cluster.local:8181/root/playground.git
+  url: ${REPO_URL_CLUSTER}
   username: root
-  password: ${GITLAB_TOKEN}
+  password: ${GITLAB_ROOT_PASSWORD}
 EOF
 
-# Always apply: it is idempotent and keeps the Application in sync with confs/.
 echo "[BONUS] Applying Argo CD application manifest..."
 kubectl apply -f "${CONFS_DIR}/argocd-app.yaml"
+# Force a refresh so the repo-server picks up the credentials immediately.
+kubectl annotate application "${APP_NAME}" -n "${ARGOCD_NS}" \
+  argocd.argoproj.io/refresh=hard --overwrite
 
-# Force refresh so repo-server picks up the credentials immediately
-kubectl patch application "${APP_NAME}" -n "${ARGOCD_NS}" \
-  --type merge -p '{"metadata": {"annotations": {"argocd.argoproj.io/refresh": "hard"}}}'
-
-echo "[BONUS] Waiting for application to sync..."
+echo "[BONUS] Waiting for the application to sync..."
 for i in $(seq 1 60); do
   SYNC=$(kubectl get application "${APP_NAME}" -n "${ARGOCD_NS}" \
-    -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "")
+    -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
   HEALTH=$(kubectl get application "${APP_NAME}" -n "${ARGOCD_NS}" \
-    -o jsonpath='{.status.health.status}' 2>/dev/null || echo "")
+    -o jsonpath='{.status.health.status}' 2>/dev/null || true)
   if [ "${SYNC}" = "Synced" ] && [ "${HEALTH}" = "Healthy" ]; then
-    echo "[BONUS] Application is Synced and Healthy!"
+    echo "[BONUS] Application is Synced and Healthy."
     break
   fi
   echo "  Sync: ${SYNC:-Pending} | Health: ${HEALTH:-Pending} (${i}/60)"
@@ -376,7 +215,7 @@ echo "============================================="
 echo "         [BONUS] Setup Complete!             "
 echo "============================================="
 echo ""
-echo "  GitLab UI:   http://localhost:8181"
+echo "  GitLab UI:   ${GITLAB_URL}"
 echo "    User:      root"
 echo "    Password:  ${GITLAB_ROOT_PASSWORD}"
 echo "    (set on GitLab's first boot only; if the gitlab-data volume already"
@@ -392,28 +231,26 @@ echo ""
 echo " Namespaces"
 kubectl get ns
 echo ""
-echo " GitLab Pods "
+echo " GitLab Pods"
 kubectl get pods -n "${GITLAB_NS}"
 echo ""
-echo " Argo CD Pods "
+echo " Argo CD Pods"
 kubectl get pods -n "${ARGOCD_NS}"
 echo ""
-echo " App Pods "
+echo " App Pods"
 kubectl get pods -n "${DEV_NS}"
 echo ""
 
 echo "[BONUS] Testing app on http://localhost:8888..."
-sleep 2
 if curl -s --max-time 5 http://localhost:8888/; then
   echo ""
-  echo "[BONUS] App is responding on http://localhost:8888!"
 else
-  echo "[BONUS] App not responding yet — give it a few seconds to start."
+  echo "[BONUS] App not responding yet, give it a few seconds to start."
 fi
 echo ""
 echo "To test the GitOps loop (v1 -> v2):"
-echo "  git clone http://localhost:8181/root/playground.git && cd playground"
+echo "  git clone ${REPO_URL_HOST} && cd ${APP_NAME}      # user: root / password above"
 echo "  sed -i 's/playground:v1/playground:v2/' deployment.yaml"
-echo "  git commit -am v2 && git push      # user: root / password above"
-echo "  # wait ~10s for Argo CD to sync, then:"
+echo "  git commit -am v2 && git push"
+echo "  # wait ~10-20s for Argo CD to sync, then:"
 echo "  curl http://localhost:8888"

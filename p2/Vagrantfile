@@ -1,17 +1,43 @@
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
 
+LOGIN     = "izouine"
+SERVER_IP = "192.168.56.110"
+
+# Official Rocky Linux box, published by the distribution itself.
+BOX_NAME   = "rockylinux-10.2-official"
+BOX_URL    = "https://dl.rockylinux.org/pub/rocky/10/images/x86_64/" \
+             "Rocky-10-Vagrant-Vbox-10.2-20260525.0.x86_64.vagrant.virtualbox.box"
+BOX_SHA256 = "5bd6cb282523eece1923d23e3c22dd7cb875b8d9df72c395d77a8d9e48f2bbc9"
+
+CONFS_DEST = "/tmp/p2-confs"
+
 Vagrant.configure("2") do |config|
-  config.vm.define "izouineS" do |izouineS|
-    izouineS.vm.box = "bento/ubuntu-24.04"
-    izouineS.vm.box_architecture = "arm64"
-    izouineS.vm.hostname = "izouineS"
-    izouineS.vm.network "private_network", ip: "192.168.56.110"
-    izouineS.vm.provider "virtualbox" do |vb|
-      vb.memory = "1024"
-      vb.cpus = 1
+  config.vm.box                        = BOX_NAME
+  config.vm.box_url                    = BOX_URL
+  config.vm.box_download_checksum      = BOX_SHA256
+  config.vm.box_download_checksum_type = "sha256"
+  config.vm.box_check_update           = false
+
+  # No Guest Additions in the official box: files are uploaded over SSH.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  config.vm.define "#{LOGIN}S" do |server|
+    server.vm.hostname = "#{LOGIN}S"
+    server.vm.network "private_network", ip: SERVER_IP
+
+    server.vm.provider "virtualbox" do |vb|
+      vb.name   = "#{LOGIN}S"
+      vb.cpus   = 1
+      vb.memory = 1024
     end
-    izouineS.vm.synced_folder ".", "/vagrant"
-    izouineS.vm.provision "shell", path: "./scripts/Installer.sh"
+
+    # Re-uploading a directory nests it, so clear the target first.
+    server.vm.provision "shell", inline: "rm -rf #{CONFS_DEST}"
+    server.vm.provision "file", source: "confs", destination: CONFS_DEST
+    server.vm.provision "shell", path: "scripts/server.sh", env: {
+      "NODE_IP"   => SERVER_IP,
+      "CONFS_DIR" => CONFS_DEST,
+    }
   end
 end

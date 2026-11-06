@@ -1,18 +1,16 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
-
 metadata:
   name: apps-ingress
-
 spec:
+  ingressClassName: traefik
+  # Any Host other than app1.com / app2.com lands on app3.
   defaultBackend:
     service:
-      name: app3-service
+      name: app-three
       port:
         number: 80
-
   rules:
-
     - host: app1.com
       http:
         paths:
@@ -20,10 +18,9 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: nginx-service
+                name: app-one
                 port:
                   number: 80
-
     - host: app2.com
       http:
         paths:
@@ -31,6 +28,16 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: apache-service
+                name: app-two
+                port:
+                  number: 80
+    # Catch-all rule (no host) so requests by bare IP also reach app3.
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app-three
                 port:
                   number: 80

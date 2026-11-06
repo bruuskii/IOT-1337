@@ -19,6 +19,9 @@ metadata:
     app: gitlab
 spec:
   replicas: 1
+  # First boot = image pull (~1.5 GB) + database migrations, often > 10 min:
+  # without this, `kubectl rollout status` aborts at the default 600s deadline.
+  progressDeadlineSeconds: 1800
   strategy:
     type: Recreate # REQUIRED: Prevents two pods from corrupting the same data volume
   selector:
@@ -48,7 +51,8 @@ spec:
 
                 # Only applied on the very first boot (empty volume).
                 # The value comes from the gitlab-root-password Secret
-                # created by scripts/script.sh.
+                # created by scripts/script.sh. GitLab rejects weak passwords
+                # (e.g. ones containing "gitlab"), which would break the seed.
                 gitlab_rails['initial_root_password'] = ENV['GITLAB_ROOT_PASSWORD']
 
                 # Allow health probes from Kubelet without 403 Forbidden
@@ -57,8 +61,6 @@ spec:
                 # Disable heavy/unused features to save RAM
                 prometheus_monitoring['enable'] = false
                 registry['enable'] = false
-                mattermost['enable'] = false
-                gitlab_pages['enable'] = false
                 gitlab_kas['enable'] = false
                 letsencrypt['enable'] = false
 
@@ -82,7 +84,7 @@ spec:
               memory: 2Gi
             limits:
               cpu: 2
-              memory: 4Gi 
+              memory: 4Gi
 
           # Mount the persistent volume so data isn't lost on pod restart
           volumeMounts:

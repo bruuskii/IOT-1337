@@ -1,27 +1,62 @@
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
 
-  Vagrant.configure("2") do |config|
-    config.vm.define "izouineS" do |izouineS|
-      izouineS.vm.box = "bento/ubuntu-24.04"
-      izouineS.vm.box_architecture = "arm64"
-      izouineS.vm.hostname = "izouineS"
-      izouineS.vm.network "private_network", ip: "192.168.56.110"
-      izouineS.vm.provider "virtualbox" do |vb|
-        vb.memory = "1024"
-        vb.cpus = 1
+require "fileutils"
+require "securerandom"
+
+LOGIN     = "izouine"
+SERVER_IP = "192.168.56.110"
+WORKER_IP = "192.168.56.111"
+
+# Official Rocky Linux box, published by the distribution itself (not the
+# HashiCorp registry). The checksum pins the exact image that was validated.
+BOX_NAME   = "rockylinux-10.2-official"
+BOX_URL    = "https://dl.rockylinux.org/pub/rocky/10/images/x86_64/" \
+             "Rocky-10-Vagrant-Vbox-10.2-20260525.0.x86_64.vagrant.virtualbox.box"
+BOX_SHA256 = "5bd6cb282523eece1923d23e3c22dd7cb875b8d9df72c395d77a8d9e48f2bbc9"
+
+# One random cluster token per checkout, shared by both nodes. It lives in the
+# git-ignored .vagrant directory, so no secret is committed and no synced
+# folder is needed to pass it from the server to the worker.
+TOKEN_FILE = File.join(__dir__, ".vagrant", "k3s-token")
+unless File.exist?(TOKEN_FILE)
+  FileUtils.mkdir_p(File.dirname(TOKEN_FILE))
+  File.write(TOKEN_FILE, SecureRandom.hex(32))
+end
+K3S_TOKEN = File.read(TOKEN_FILE).strip
+
+NODES = [
+  { name: "#{LOGIN}S",  ip: SERVER_IP, script: "scripts/server.sh" },
+  { name: "#{LOGIN}SW", ip: WORKER_IP, script: "scripts/agent.sh" },
+].freeze
+
+Vagrant.configure("2") do |config|
+  config.vm.box                        = BOX_NAME
+  config.vm.box_url                    = BOX_URL
+  config.vm.box_download_checksum      = BOX_SHA256
+  config.vm.box_download_checksum_type = "sha256"
+  config.vm.box_check_update           = false
+
+  # The official box ships without VirtualBox Guest Additions: provisioning
+  # scripts are uploaded over SSH instead of through a shared folder.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  NODES.each do |node|
+    config.vm.define node[:name] do |machine|
+      machine.vm.hostname = node[:name]
+      machine.vm.network "private_network", ip: node[:ip]
+
+      machine.vm.provider "virtualbox" do |vb|
+        vb.name   = node[:name]
+        vb.cpus   = 1
+        vb.memory = 1024
       end
-      izouineS.vm.provision "shell", path: "./Controller.sh"
+
+      machine.vm.provision "shell", path: node[:script], env: {
+        "K3S_TOKEN" => K3S_TOKEN,
+        "SERVER_IP" => SERVER_IP,
+        "NODE_IP"   => node[:ip],
+      }
     end
-    config.vm.define "izouineSW" do |izouineSW|
-      izouineSW.vm.box = "bento/ubuntu-24.04"
-      izouineSW.vm.box_architecture = "arm64"
-      izouineSW.vm.hostname = "izouineSW"
-      izouineSW.vm.network "private_network", ip: "192.168.56.111"
-      izouineSW.vm.provider "virtualbox" do |vb|
-        vb.memory = "1024"
-        vb.cpus = 1
-      end
-      izouineSW.vm.provision "shell", path: "./Agent.sh"
-    end
+  end
 end

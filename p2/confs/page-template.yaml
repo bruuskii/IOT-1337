@@ -1,0 +1,16 @@
+# One nginx config template shared by the three applications. The official
+# nginx image renders /etc/nginx/templates/*.template with envsubst at start,
+# so each pod answers with its APP_NAME and its own pod name (HOSTNAME).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hello-page
+data:
+  default.conf.template: |
+    server {
+      listen 80;
+      location / {
+        default_type text/html;
+        return 200 '<!doctype html><html><head><title>${APP_NAME}</title></head><body><h1>Hello from ${APP_NAME}.</h1><p>Pod: ${HOSTNAME}</p></body></html>\n';
+      }
+    }
