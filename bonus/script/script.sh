@@ -11,7 +11,7 @@
 
 
 set -euo pipefail 
--
+
 CLUSTER_NAME="iot"
 ARGOCD_NS="argocd"
 DEV_NS="dev"
