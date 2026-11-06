@@ -39,9 +39,17 @@ spec:
           env:
             - name: GITLAB_OMNIBUS_CONFIG
               value: |
+                # Clone/UI URLs advertise localhost:8181 (k3d maps it to the
+                # Service), but nginx inside the pod must stay on port 80,
+                # which is what the probe and the Service target.
                 external_url 'http://localhost:8181'
-                gitlab_rails['nginx']['listen_port'] = 80
-                gitlab_rails['initial_root_password'] = 'password'
+                nginx['listen_port'] = 80
+                nginx['listen_https'] = false
+
+                # Only applied on the very first boot (empty volume).
+                # The value comes from the gitlab-root-password Secret
+                # created by scripts/script.sh.
+                gitlab_rails['initial_root_password'] = ENV['GITLAB_ROOT_PASSWORD']
 
                 # Allow health probes from Kubelet without 403 Forbidden
                 gitlab_rails['monitoring_whitelist'] = ['0.0.0.0/0', '127.0.0.0/8']
@@ -62,7 +70,11 @@ spec:
                 postgresql['shared_buffers'] = "256MB"
                 postgresql['max_connections'] = 100
                 postgresql['max_locks_per_transaction'] = 256
-                gitaly['ruby_max_rss'] = 100_000_000
+            - name: GITLAB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gitlab-root-password
+                  key: password
 
           resources:
             requests:

@@ -25,7 +25,7 @@ metadata:
   name: playground-service
   namespace: dev
 spec:
-  type: ClusterIP
+  type: LoadBalancer
   selector:
     app: playground
   ports:

@@ -8,7 +8,7 @@ spec:
   source:
     repoURL: http://gitlab.gitlab.svc.cluster.local:8181/root/playground.git
     targetRevision: main
-    path: p3/manifests
+    path: .
   destination:
     server: https://kubernetes.default.svc
     namespace: dev
@@ -16,3 +16,5 @@ spec:
     automated:
       prune: true
       selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
